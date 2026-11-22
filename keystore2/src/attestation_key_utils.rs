@@ -45,6 +45,10 @@ pub enum AttestationKeyInfo {
         blob: Vec<u8>,
         blob_metadata: BlobMetaData,
         issuer_subject: Vec<u8>,
+        /// DER-encoded certificate of the user-generated attestation key.
+        attest_cert: Vec<u8>,
+        /// PKCS#8 DER of Yasvara's software signing keypair when this attestation key is managed.
+        sw_attest_key: Option<Vec<u8>>,
     },
 }
 
@@ -84,21 +88,28 @@ fn get_user_generated_attestation_key(
     caller_uid: AppUid,
     db: &mut KeystoreDB,
 ) -> Result<AttestationKeyInfo> {
-    let (key_id_guard, blob, cert, blob_metadata) =
+    let (key_id_guard, blob, cert, blob_metadata, sw_attest_key) =
         load_attest_key_blob_and_cert(key, caller_uid, db)
             .context(ks_err!("Failed to load blob and cert"))?;
 
     let issuer_subject: Vec<u8> = parse_subject_from_certificate(&cert)
         .context(ks_err!("Failed to parse subject from certificate"))?;
 
-    Ok(AttestationKeyInfo::UserGenerated { key_id_guard, blob, issuer_subject, blob_metadata })
+    Ok(AttestationKeyInfo::UserGenerated {
+        key_id_guard,
+        blob,
+        issuer_subject,
+        blob_metadata,
+        attest_cert: cert,
+        sw_attest_key,
+    })
 }
 
 fn load_attest_key_blob_and_cert(
     key: &KeyDescriptor,
     caller_uid: AppUid,
     db: &mut KeystoreDB,
-) -> Result<(KeyIdGuard, Vec<u8>, Vec<u8>, BlobMetaData)> {
+) -> Result<(KeyIdGuard, Vec<u8>, Vec<u8>, BlobMetaData, Option<Vec<u8>>)> {
     match key.domain {
         Domain::BLOB => Err(Error::Km(ErrorCode::INVALID_ARGUMENT))
             .context(ks_err!("Domain::BLOB attestation keys not supported")),
@@ -113,6 +124,7 @@ fn load_attest_key_blob_and_cert(
                 )
                 .context(ks_err!("Failed to load key."))?;
 
+            let sw_attest_key = key_entry.metadata().yasvara_attest_key().cloned();
             let (blob, blob_metadata) = key_entry
                 .take_key_blob_info()
                 .ok_or(Error::Rc(ResponseCode::INVALID_ARGUMENT))
@@ -121,7 +133,7 @@ fn load_attest_key_blob_and_cert(
                 .take_cert()
                 .ok_or(Error::Rc(ResponseCode::INVALID_ARGUMENT))
                 .context(ks_err!("Successfully loaded key entry, but cert was missing"))?;
-            Ok((key_id_guard, blob, cert, blob_metadata))
+            Ok((key_id_guard, blob, cert, blob_metadata, sw_attest_key))
         }
     }
 }

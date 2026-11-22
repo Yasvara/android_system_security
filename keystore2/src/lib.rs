@@ -42,6 +42,8 @@ pub mod security_level_manager;
 pub mod service;
 pub mod shared_secret_negotiation;
 pub mod utils;
+/// Yasvara: native KeyMint attestation re-signing for Play Integrity.
+pub mod yasvara;
 
 mod attestation_key_utils;
 mod audit_log;

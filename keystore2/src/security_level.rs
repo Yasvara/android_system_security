@@ -137,6 +137,7 @@ impl KeystoreSecurityLevel {
         creation_result: KeyCreationResult,
         user: AndroidUserId,
         flags: Option<i32>,
+        sw_attest_key: Option<&[u8]>,
     ) -> Result<KeyMetadata> {
         let KeyCreationResult {
             keyBlob: key_blob,
@@ -204,6 +205,9 @@ impl KeystoreSecurityLevel {
 
                     let mut key_metadata = KeyMetaData::new();
                     key_metadata.add(KeyMetaEntry::CreationDate(creation_date));
+                    if let Some(attest_pkcs8) = sw_attest_key {
+                        key_metadata.add(KeyMetaEntry::YasvaraAttestKey(attest_pkcs8.to_vec()));
+                    }
                     blob_metadata.add(BlobMetaEntry::KmUuid(self.km_uuid));
 
                     let key_id = db
@@ -441,6 +445,15 @@ impl KeystoreSecurityLevel {
         })
     }
 
+    fn set_attestation_application_id(params: &mut Vec<KeyParameter>, aaid: Vec<u8>) {
+        // Only the AAID fetched for the Binder caller may drive attestation and target policy.
+        params.retain(|kp| kp.tag != Tag::ATTESTATION_APPLICATION_ID);
+        params.push(KeyParameter {
+            tag: Tag::ATTESTATION_APPLICATION_ID,
+            value: KeyParameterValue::Blob(aaid),
+        });
+    }
+
     fn add_required_parameters(
         &self,
         uid: AppUid,
@@ -483,15 +496,21 @@ impl KeystoreSecurityLevel {
         }
 
         // If there is an attestation challenge we need to get an application id.
-        if params.iter().any(|kp| kp.tag == Tag::ATTESTATION_CHALLENGE) {
+        if let Some(kp) = params.iter().find(|kp| kp.tag == Tag::ATTESTATION_CHALLENGE) {
+            if let KeyParameterValue::Blob(ref challenge) = kp.value {
+                if challenge.len() > 128 {
+                    return Err(Error::Km(ErrorCode::INVALID_INPUT_LENGTH)).context(ks_err!(
+                        "KeystoreSecurityLevel::add_required_parameters: \
+                        Attestation challenge size {} exceeds 128 bytes.",
+                        challenge.len()
+                    ));
+                }
+            }
             let _wp =
                 self.watch(" KeystoreSecurityLevel::add_required_parameters: calling get_aaid");
             match keystore2_aaid::get_aaid(uid.0 as u32) {
                 Ok(aaid_ok) => {
-                    result.push(KeyParameter {
-                        tag: Tag::ATTESTATION_APPLICATION_ID,
-                        value: KeyParameterValue::Blob(aaid_ok),
-                    });
+                    Self::set_attestation_application_id(&mut result, aaid_ok);
                 }
                 Err(e) if e == ResponseCode::GET_ATTESTATION_APPLICATION_ID_FAILED.0 as u32 => {
                     return Err(Error::Rc(ResponseCode::GET_ATTESTATION_APPLICATION_ID_FAILED))
@@ -728,6 +747,25 @@ impl KeystoreSecurityLevel {
         let params = self
             .add_required_parameters(caller_uid, params, &key)
             .context(ks_err!("Trying to get aaid."))?;
+        let user_attest_signer = match &attestation_key_info {
+            Some(AttestationKeyInfo::UserGenerated { attest_cert, sw_attest_key, .. }) => {
+                Some((attest_cert.clone(), sw_attest_key.clone()))
+            }
+            _ => None,
+        };
+        let explicit_signer = match (&attest_key_descriptor, &user_attest_signer) {
+            (None, _) => crate::yasvara::ExplicitSigner::None,
+            (Some(_), Some((attest_cert, Some(sw_pkcs8)))) => {
+                crate::yasvara::ExplicitSigner::Managed { attest_cert, sw_pkcs8 }
+            }
+            (Some(_), _) => crate::yasvara::ExplicitSigner::Unmanaged,
+        };
+        let attestation_policy = crate::yasvara::RequestPolicy::for_request(
+            &params,
+            caller_uid.0 as u32,
+            explicit_signer,
+        );
+        let params = crate::yasvara::prepare_keymint_params(&params, &attestation_policy);
 
         let creation_result = match attestation_key_info {
             Some(AttestationKeyInfo::UserGenerated {
@@ -735,6 +773,8 @@ impl KeystoreSecurityLevel {
                 blob,
                 blob_metadata,
                 issuer_subject,
+                attest_cert: _,
+                sw_attest_key: _,
             }) => self
                 .upgrade_keyblob_if_required_with(
                     Some(key_id_guard),
@@ -810,8 +850,23 @@ impl KeystoreSecurityLevel {
         }
         .context(ks_err!())?;
 
+        // Yasvara: native Keystore2 leaf re-signing (RKP + software-backed ATTEST_KEY paths).
+        let patched = crate::yasvara::maybe_patch_generated_key(
+            &params,
+            creation_result,
+            caller_uid.0 as u32,
+            &attestation_policy,
+        );
+
         let user = caller_uid.owning_user();
-        self.store_new_key(key, creation_result, user, Some(flags)).context(ks_err!())
+        self.store_new_key(
+            key,
+            patched.result,
+            user,
+            Some(flags),
+            patched.sw_attest_key.as_deref(),
+        )
+        .context(ks_err!())
     }
 
     fn import_key(
@@ -845,7 +900,6 @@ impl KeystoreSecurityLevel {
         let params = self
             .add_required_parameters(caller_uid, params, &key)
             .context(ks_err!("Trying to get aaid."))?;
-
         let format = params
             .iter()
             .find(|p| p.tag == Tag::ALGORITHM)
@@ -871,8 +925,14 @@ impl KeystoreSecurityLevel {
         })
         .context(ks_err!("Trying to call importKey"))?;
 
+        let imported_attest_key = if format == KeyFormat::PKCS8 {
+            crate::yasvara::validated_imported_attest_key(caller_uid.0 as u32, &params, key_data)
+        } else {
+            None
+        };
         let user = caller_uid.owning_user();
-        self.store_new_key(key, creation_result, user, Some(flags)).context(ks_err!())
+        self.store_new_key(key, creation_result, user, Some(flags), imported_attest_key.as_deref())
+            .context(ks_err!())
     }
 
     fn import_wrapped_key(
@@ -996,7 +1056,7 @@ impl KeystoreSecurityLevel {
             )
             .context(ks_err!())?;
 
-        self.store_new_key(key, creation_result, user, None)
+        self.store_new_key(key, creation_result, user, None, None)
             .context(ks_err!("Trying to store the new key for {user:?}"))
     }
 
@@ -1323,6 +1383,52 @@ mod tests {
     };
     use keystore2_crypto::parse_subject_from_certificate;
     use rkpd_client::get_rkpd_attestation_key;
+
+    #[test]
+    fn keystore_aaid_replaces_all_caller_supplied_duplicates() {
+        let unrelated = KeyParameter {
+            tag: Tag::ATTESTATION_CHALLENGE,
+            value: KeyParameterValue::Blob(vec![1, 2, 3]),
+        };
+        let mut params = vec![
+            KeyParameter {
+                tag: Tag::ATTESTATION_APPLICATION_ID,
+                value: KeyParameterValue::Blob(b"caller supplied".to_vec()),
+            },
+            unrelated.clone(),
+            KeyParameter {
+                tag: Tag::ATTESTATION_APPLICATION_ID,
+                value: KeyParameterValue::Integer(42),
+            },
+        ];
+        KeystoreSecurityLevel::set_attestation_application_id(
+            &mut params,
+            b"keystore AAID".to_vec(),
+        );
+        assert_eq!(
+            params,
+            vec![
+                unrelated,
+                KeyParameter {
+                    tag: Tag::ATTESTATION_APPLICATION_ID,
+                    value: KeyParameterValue::Blob(b"keystore AAID".to_vec()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn keystore_aaid_is_added_when_not_supplied() {
+        let mut params = Vec::new();
+        KeystoreSecurityLevel::set_attestation_application_id(&mut params, vec![1, 2, 3]);
+        assert_eq!(
+            params,
+            vec![KeyParameter {
+                tag: Tag::ATTESTATION_APPLICATION_ID,
+                value: KeyParameterValue::Blob(vec![1, 2, 3]),
+            }]
+        );
+    }
 
     #[test]
     // This is a helper for a manual test. We want to check that after a system upgrade RKPD

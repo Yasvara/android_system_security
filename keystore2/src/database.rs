@@ -155,6 +155,8 @@ impl_metadata!(
         AttestationRawPubKey(Vec<u8>) with accessor attestation_raw_pub_key,
         /// SEC1 public key for ECDH encryption
         Sec1PublicKey(Vec<u8>) with accessor sec1_public_key,
+        /// Yasvara software signing keypair (PKCS#8 DER) backing a PURPOSE_ATTEST_KEY entry.
+        YasvaraAttestKey(Vec<u8>) with accessor yasvara_attest_key,
         //  --- ADD NEW META DATA FIELDS HERE ---
         // For backwards compatibility add new entries only to
         // end of this list and above this comment.
