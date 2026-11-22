@@ -19,11 +19,13 @@
 #include "crypto.hpp"
 
 #include <assert.h>
+#include <limits.h>
 #include <log/log.h>
 #include <openssl/aes.h>
 #include <openssl/ec.h>
 #include <openssl/ec_key.h>
 #include <openssl/ecdh.h>
+#include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/hkdf.h>
 #include <openssl/hmac.h>
@@ -318,4 +320,39 @@ int extractSubjectFromCertificate(const uint8_t* cert_buf, size_t cert_len, uint
     // subject_buf has enough space.
     uint8_t* tmp = subject_buf;
     return i2d_X509_NAME(subject, &tmp);
+}
+
+bool verifyX509Signature(const uint8_t* cert_buf, size_t cert_len, const uint8_t* issuer_buf,
+                         size_t issuer_len) {
+    if (!cert_buf || cert_len == 0 || cert_len > static_cast<size_t>(LONG_MAX) || !issuer_buf ||
+        issuer_len == 0 || issuer_len > static_cast<size_t>(LONG_MAX)) {
+        return false;
+    }
+
+    const uint8_t* cert_p = cert_buf;
+    bssl::UniquePtr<X509> cert(d2i_X509(nullptr, &cert_p, static_cast<long>(cert_len)));
+    if (!cert || cert_p != cert_buf + cert_len) {
+        ERR_clear_error();
+        return false;
+    }
+
+    const uint8_t* issuer_p = issuer_buf;
+    bssl::UniquePtr<X509> issuer(d2i_X509(nullptr, &issuer_p, static_cast<long>(issuer_len)));
+    if (!issuer || issuer_p != issuer_buf + issuer_len) {
+        ERR_clear_error();
+        return false;
+    }
+
+    bssl::UniquePtr<EVP_PKEY> pubkey(X509_get_pubkey(issuer.get()));
+    if (!pubkey) {
+        ERR_clear_error();
+        return false;
+    }
+
+    int ok = X509_verify(cert.get(), pubkey.get());
+    if (ok != 1) {
+        ERR_clear_error();
+        return false;
+    }
+    return true;
 }

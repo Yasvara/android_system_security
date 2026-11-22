@@ -19,10 +19,10 @@ mod error;
 pub mod zvec;
 pub use error::Error;
 use keystore2_crypto_bindgen::{
-    extractSubjectFromCertificate, hmacSha256, randomBytes, AES_gcm_decrypt, AES_gcm_encrypt,
-    ECDHComputeKey, ECKEYGenerateKey, ECKEYMarshalPrivateKey, ECKEYParsePrivateKey,
-    ECPOINTOct2Point, ECPOINTPoint2Oct, EC_KEY_free, EC_KEY_get0_public_key, EC_POINT_free,
-    HKDFExpand, HKDFExtract, EC_KEY, EC_POINT, EVP_MAX_MD_SIZE, PBKDF2,
+    extractSubjectFromCertificate, hmacSha256, randomBytes, verifyX509Signature, AES_gcm_decrypt,
+    AES_gcm_encrypt, ECDHComputeKey, ECKEYGenerateKey, ECKEYMarshalPrivateKey,
+    ECKEYParsePrivateKey, ECPOINTOct2Point, ECPOINTPoint2Oct, EC_KEY_free, EC_KEY_get0_public_key,
+    EC_POINT_free, HKDFExpand, HKDFExtract, EC_KEY, EC_POINT, EVP_MAX_MD_SIZE, PBKDF2,
 };
 use std::convert::TryFrom;
 use std::convert::TryInto;
@@ -501,6 +501,24 @@ pub fn parse_subject_from_certificate(cert_buf: &[u8]) -> Result<Vec<u8>, Error>
     retval.truncate(safe_size);
 
     Ok(retval)
+}
+
+/// Uses BoringSSL `X509_verify` to verify that `cert_der` was signed by `issuer_der`'s public key.
+/// Supports cross-curve/digest combinations such as P-384 signing with SHA-256 (`ecdsa-with-SHA256`).
+pub fn verify_x509_signature(cert_der: &[u8], issuer_der: &[u8]) -> bool {
+    if cert_der.is_empty() || issuer_der.is_empty() {
+        return false;
+    }
+    // Safety: verifyX509Signature only reads cert_der[..cert_der.len()] and
+    // issuer_der[..issuer_der.len()] during the call and does not retain pointers.
+    unsafe {
+        verifyX509Signature(
+            cert_der.as_ptr(),
+            cert_der.len(),
+            issuer_der.as_ptr(),
+            issuer_der.len(),
+        )
+    }
 }
 
 #[cfg(test)]

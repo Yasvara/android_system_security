@@ -87,6 +87,7 @@ rust_bindgen {
         "--allowlist-function=extractSubjectFromCertificate",
         "--allowlist-function=hmacSha256",
         "--allowlist-function=randomBytes",
+        "--allowlist-function=verifyX509Signature",
         "--allowlist-type=EC_KEY",
         "--allowlist-type=EC_POINT",
         "--allowlist-var=EVP_MAX_MD_SIZE",

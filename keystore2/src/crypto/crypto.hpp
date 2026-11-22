@@ -86,4 +86,9 @@ extern "C" {
 int extractSubjectFromCertificate(const uint8_t* cert_buf, size_t cert_len,
                                   uint8_t* subject_buf, size_t subject_buf_len);
 
+// Verify that the DER-encoded X.509 certificate in cert_buf was cryptographically
+// signed by the public key of the DER-encoded X.509 issuer certificate in issuer_buf.
+bool verifyX509Signature(const uint8_t* cert_buf, size_t cert_len,
+                         const uint8_t* issuer_buf, size_t issuer_len);
+
 #endif  //  __CRYPTO_H__
