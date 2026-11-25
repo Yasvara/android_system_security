@@ -160,6 +160,17 @@ pub fn validated_imported_attest_key(
     keybox::SigningKey::from_pkcs8_der(key_data).map(|k| k.to_pkcs8_der())
 }
 
+/// Returns true only when built-in Yasvara PIF spoofing is explicitly enabled (and not
+/// yielded to an external Akar/Zygisk PIF module). When false, Keystore2 becomes a pure
+/// pass-through for `ATTESTATION_ID_*` and OS/device overrides (Audit F1-F3 fix).
+fn is_builtin_pif_enabled() -> bool {
+    match system_properties::read("persist.sys.yasvara.pif.enabled").ok().flatten() {
+        Some(v) if v.trim() == "0" || v.trim().eq_ignore_ascii_case("false") => false,
+        Some(v) if v.trim() == "1" || v.trim().eq_ignore_ascii_case("true") => true,
+        _ => pif_prop("brand").is_some() || pif_prop("model").is_some(),
+    }
+}
+
 /// Rewrites caller-supplied `ATTESTATION_ID_*` parameters (which carry PIF-spoofed `Build.*`
 /// values in GMS / Play Store) back to the real hardware vendor properties before calling
 /// `IKeyMintDevice::generateKey`, preventing `ErrorCode::CANNOT_ATTEST_IDS` from TrustZone,
@@ -169,6 +180,7 @@ pub fn prepare_keymint_params(
     policy: &RequestPolicy,
 ) -> Vec<KeyParameter> {
     if policy.patch.is_none()
+        || !is_builtin_pif_enabled()
         || !params.iter().any(|kp| kp.tag == Tag::ATTESTATION_CHALLENGE)
         || !is_pif_collector_caller(params)
     {
@@ -236,9 +248,9 @@ struct PatchInputs {
 
 impl PatchInputs {
     fn from_request(params: &[KeyParameter], context: &AttestationContext) -> Self {
-        // Apply PIF identity/OS overrides only to PIF-spoofed collector packages;
-        // other target apps keep their real hardware IDs and host OS version/patch.
-        let use_pif = is_pif_collector_caller(params);
+        // Apply PIF identity/OS overrides only to PIF-spoofed collector packages when built-in
+        // PIF is enabled; other target apps (and external PIF modules) keep clean host values.
+        let use_pif = is_builtin_pif_enabled() && is_pif_collector_caller(params);
         let id_overrides = if use_pif { resolve_id_overrides() } else { None };
         let (os_version, os_patchlevel) =
             if use_pif { resolve_os_values() } else { resolve_host_os_values() };
