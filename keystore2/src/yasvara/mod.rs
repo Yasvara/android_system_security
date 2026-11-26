@@ -179,51 +179,72 @@ pub fn prepare_keymint_params(
     params: &[KeyParameter],
     policy: &RequestPolicy,
 ) -> Vec<KeyParameter> {
-    if policy.patch.is_none()
-        || !is_builtin_pif_enabled()
-        || !params.iter().any(|kp| kp.tag == Tag::ATTESTATION_CHALLENGE)
-        || !is_pif_collector_caller(params)
-    {
+    let Some(context) = policy.patch.as_ref() else {
+        return params.to_vec();
+    };
+    if !params.iter().any(|kp| kp.tag == Tag::ATTESTATION_CHALLENGE) {
         return params.to_vec();
     }
-    params
-        .iter()
-        .filter(|kp| {
-            !matches!(
-                kp.tag,
-                Tag::ATTESTATION_ID_SERIAL
-                    | Tag::ATTESTATION_ID_IMEI
-                    | Tag::ATTESTATION_ID_MEID
-                    | Tag::ATTESTATION_ID_SECOND_IMEI
-            )
-        })
-        .map(|kp| {
-            let hw_val = match kp.tag {
-                Tag::ATTESTATION_ID_BRAND => {
-                    hw_prop(&["ro.product.vendor.brand", "ro.product.brand"])
+    if is_builtin_pif_enabled() && is_pif_collector_caller(params) {
+        return params
+            .iter()
+            .filter(|kp| {
+                !matches!(
+                    kp.tag,
+                    Tag::ATTESTATION_ID_SERIAL
+                        | Tag::ATTESTATION_ID_IMEI
+                        | Tag::ATTESTATION_ID_MEID
+                        | Tag::ATTESTATION_ID_SECOND_IMEI
+                )
+            })
+            .map(|kp| {
+                let hw_val = match kp.tag {
+                    Tag::ATTESTATION_ID_BRAND => {
+                        hw_prop(&["ro.product.vendor.brand", "ro.product.brand"])
+                    }
+                    Tag::ATTESTATION_ID_DEVICE => {
+                        hw_prop(&["ro.product.vendor.device", "ro.product.device"])
+                    }
+                    Tag::ATTESTATION_ID_PRODUCT => {
+                        hw_prop(&["ro.product.vendor.name", "ro.product.name"])
+                    }
+                    Tag::ATTESTATION_ID_MANUFACTURER => {
+                        hw_prop(&["ro.product.vendor.manufacturer", "ro.product.manufacturer"])
+                    }
+                    Tag::ATTESTATION_ID_MODEL => {
+                        hw_prop(&["ro.product.vendor.model", "ro.product.model"])
+                    }
+                    _ => None,
+                };
+                match hw_val {
+                    Some(v) => {
+                        KeyParameter { tag: kp.tag, value: KeyParameterValue::Blob(v.into_bytes()) }
+                    }
+                    None => kp.clone(),
                 }
-                Tag::ATTESTATION_ID_DEVICE => {
-                    hw_prop(&["ro.product.vendor.device", "ro.product.device"])
+            })
+            .collect();
+    }
+    if context.keybox.rkp_manufacturer.is_some()
+        && params.iter().any(|kp| kp.tag == Tag::ATTESTATION_ID_MANUFACTURER)
+    {
+        let hw_mfg = hw_prop(&["ro.product.vendor.manufacturer", "ro.product.manufacturer"]);
+        return params
+            .iter()
+            .map(|kp| {
+                if kp.tag == Tag::ATTESTATION_ID_MANUFACTURER {
+                    if let Some(ref v) = hw_mfg {
+                        return KeyParameter {
+                            tag: kp.tag,
+                            value: KeyParameterValue::Blob(v.as_bytes().to_vec()),
+                        };
+                    }
                 }
-                Tag::ATTESTATION_ID_PRODUCT => {
-                    hw_prop(&["ro.product.vendor.name", "ro.product.name"])
-                }
-                Tag::ATTESTATION_ID_MANUFACTURER => {
-                    hw_prop(&["ro.product.vendor.manufacturer", "ro.product.manufacturer"])
-                }
-                Tag::ATTESTATION_ID_MODEL => {
-                    hw_prop(&["ro.product.vendor.model", "ro.product.model"])
-                }
-                _ => None,
-            };
-            match hw_val {
-                Some(v) => {
-                    KeyParameter { tag: kp.tag, value: KeyParameterValue::Blob(v.into_bytes()) }
-                }
-                None => kp.clone(),
-            }
-        })
-        .collect()
+                kp.clone()
+            })
+            .collect();
+    }
+    params.to_vec()
 }
 
 fn hw_prop(keys: &[&str]) -> Option<String> {
@@ -249,9 +270,17 @@ struct PatchInputs {
 impl PatchInputs {
     fn from_request(params: &[KeyParameter], context: &AttestationContext) -> Self {
         // Apply PIF identity/OS overrides only to PIF-spoofed collector packages when built-in
-        // PIF is enabled; other target apps (and external PIF modules) keep clean host values.
-        let use_pif = is_builtin_pif_enabled() && is_pif_collector_caller(params);
-        let id_overrides = if use_pif { resolve_id_overrides() } else { None };
+        // PIF is enabled; non-collector target apps align ATTESTATION_ID_MANUFACTURER with the
+        // installed RKP keybox when one is present, keeping host OS/patch/device fields clean.
+        let is_collector = is_pif_collector_caller(params);
+        let use_pif = is_builtin_pif_enabled() && is_collector;
+        let id_overrides = if use_pif {
+            resolve_id_overrides()
+        } else if !is_collector {
+            resolve_rkp_id_overrides(&context.keybox)
+        } else {
+            None
+        };
         let (os_version, os_patchlevel) =
             if use_pif { resolve_os_values() } else { resolve_host_os_values() };
         let long_patch = if use_pif { resolve_long_patch() } else { resolve_host_long_patch() };
@@ -486,6 +515,20 @@ fn pif_prop(key: &str) -> Option<String> {
         .ok()
         .flatten()
         .filter(|s| !s.trim().is_empty())
+}
+
+fn resolve_rkp_id_overrides(keybox: &keybox::KeyboxEntry) -> Option<DeviceIdOverrides> {
+    let manufacturer = keybox.rkp_manufacturer.as_deref()?.trim();
+    if manufacturer.is_empty() {
+        return None;
+    }
+    Some(DeviceIdOverrides {
+        brand: String::new(),
+        device: String::new(),
+        product: String::new(),
+        manufacturer: manufacturer.to_string(),
+        model: String::new(),
+    })
 }
 
 fn resolve_id_overrides() -> Option<DeviceIdOverrides> {

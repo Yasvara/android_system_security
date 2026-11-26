@@ -229,7 +229,12 @@ pub fn patch_key_description(
         overrides.push((TAG_BOOT_PATCHLEVEL, explicit_integer(TAG_BOOT_PATCHLEVEL, b)));
     }
 
-    let strip_hw_unique_ids = config.id_overrides.is_some();
+    let strip_hw_unique_ids = config.id_overrides.is_some_and(|ids| {
+        !ids.brand.is_empty()
+            || !ids.device.is_empty()
+            || !ids.product.is_empty()
+            || !ids.model.is_empty()
+    });
     let mut seen = Vec::new();
     let sw = replace_in_list(sw, &overrides, strip_hw_unique_ids, &mut seen)?;
     let mut hw = replace_in_list(hw, &overrides, strip_hw_unique_ids, &mut seen)?;

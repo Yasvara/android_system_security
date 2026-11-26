@@ -25,6 +25,12 @@ pub const RSA_SHA256_SIG_OID: ObjectIdentifier =
     ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.11");
 pub const P256_CURVE_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.3.1.7");
 pub const P384_CURVE_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.132.0.34");
+pub const PROVISIONING_INFO_OID: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap("1.3.6.1.4.1.11129.2.1.30");
+
+const MAX_PROVISIONING_BYTES: usize = 64 * 1024;
+const MAX_CBOR_DEPTH: usize = 32;
+const MAX_PROP_VALUE_BYTES: usize = 91;
 
 #[path = "keybox_cache.rs"]
 mod cache;
@@ -153,6 +159,8 @@ impl SigningKey {
 pub struct KeyboxEntry {
     pub ec: Option<(EcSigningKey, Vec<Vec<u8>>)>,
     pub rsa: Option<(RsaPrivateKey, Vec<Vec<u8>>)>,
+    /// ProvisioningInfo (OID 1.3.6.1.4.1.11129.2.1.30) CBOR map[3] manufacturer, if present.
+    pub rkp_manufacturer: Option<String>,
 }
 
 impl KeyboxEntry {
@@ -206,7 +214,9 @@ pub fn current() -> Option<KeyboxEntry> {
 /// Simple regex-free XML parser for keybox.xml format.
 /// Diagnostics stay in current() so retries cannot bypass its warning rate limit.
 pub fn parse_keybox_xml(xml: &str) -> Option<KeyboxEntry> {
-    let mut entry = KeyboxEntry { ec: None, rsa: None };
+    let mut entry = KeyboxEntry { ec: None, rsa: None, rkp_manufacturer: None };
+    let mut ec_rkp_mfg: Option<String> = None;
+    let mut rsa_rkp_mfg: Option<String> = None;
     // 1. Find <Key algorithm="..."> block
     let key_start_tag = "<Key ";
     let mut search_idx = 0;
@@ -286,19 +296,12 @@ pub fn parse_keybox_xml(xml: &str) -> Option<KeyboxEntry> {
             search_idx = next_search_idx;
             continue;
         }
-        if !validate_chain(&certs) {
+        let Some(parsed_certs) = validate_and_parse_chain(&certs) else {
             warn!("YasvaraKeybox: rejecting {} key with an invalid certificate chain", algo);
             search_idx = next_search_idx;
             continue;
-        }
-        let leaf = match Certificate::from_der(&certs[0]) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("YasvaraKeybox: failed to parse leaf certificate: {:?}", e);
-                search_idx = next_search_idx;
-                continue;
-            }
         };
+        let leaf = &parsed_certs[0];
         let leaf_spki = match leaf.tbs_certificate.subject_public_key_info.to_der() {
             Ok(d) => d,
             Err(e) => {
@@ -319,7 +322,10 @@ pub fn parse_keybox_xml(xml: &str) -> Option<KeyboxEntry> {
             }
             match EcSigningKey::from_der(&priv_der) {
                 Some(k) if k.matches_spki(leaf_spki.as_slice()) => {
-                    entry.ec.get_or_insert((k, certs));
+                    if entry.ec.is_none() {
+                        ec_rkp_mfg = extract_rkp_manufacturer(&parsed_certs);
+                        entry.ec = Some((k, certs));
+                    }
                 }
                 Some(_) => warn!("YasvaraKeybox: EC private key does not match leaf certificate"),
                 None => warn!("YasvaraKeybox: failed to parse EC private key"),
@@ -337,7 +343,10 @@ pub fn parse_keybox_xml(xml: &str) -> Option<KeyboxEntry> {
                     if k.as_public().to_der_subject_public_key_info().as_ref()
                         == leaf_spki.as_slice() =>
                 {
-                    entry.rsa.get_or_insert((k, certs));
+                    if entry.rsa.is_none() {
+                        rsa_rkp_mfg = extract_rkp_manufacturer(&parsed_certs);
+                        entry.rsa = Some((k, certs));
+                    }
                 }
                 Some(_) => warn!("YasvaraKeybox: RSA private key does not match leaf certificate"),
                 None => warn!("YasvaraKeybox: failed to parse RSA private key"),
@@ -346,16 +355,22 @@ pub fn parse_keybox_xml(xml: &str) -> Option<KeyboxEntry> {
 
         search_idx = next_search_idx;
     }
+    entry.rkp_manufacturer = ec_rkp_mfg.or(rsa_rkp_mfg);
     (entry.ec.is_some() || entry.rsa.is_some()).then_some(entry)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn validate_chain(chain: &[Vec<u8>]) -> bool {
+    validate_and_parse_chain(chain).is_some()
 }
 
 /// Each certificate must be signed by the next one. Validity dates are deliberately
 /// not enforced so an expired keybox keeps loading. Uses BoringSSL `X509_verify` so
 /// cross-curve/digest issuer signatures (e.g. P-384 TEE intermediate signing a P-256
 /// batch cert with `ecdsa-with-SHA256`) verify accurately.
-fn validate_chain(chain: &[Vec<u8>]) -> bool {
+fn validate_and_parse_chain(chain: &[Vec<u8>]) -> Option<Vec<Certificate>> {
     if chain.len() < 2 {
-        return false;
+        return None;
     }
     let mut certs = Vec::with_capacity(chain.len());
     for der in chain {
@@ -363,7 +378,7 @@ fn validate_chain(chain: &[Vec<u8>]) -> bool {
             Ok(cert) => certs.push(cert),
             Err(e) => {
                 warn!("YasvaraKeybox: failed to parse chain certificate: {:?}", e);
-                return false;
+                return None;
             }
         }
     }
@@ -372,15 +387,15 @@ fn validate_chain(chain: &[Vec<u8>]) -> bool {
         let issuer = &certs[i + 1];
         if cert.tbs_certificate.issuer != issuer.tbs_certificate.subject {
             warn!("YasvaraKeybox: chain issuer mismatch at index {}", i);
-            return false;
+            return None;
         }
         if cert.signature.raw_bytes().is_empty() {
             warn!("YasvaraKeybox: empty signature at index {}", i);
-            return false;
+            return None;
         }
         if !keystore2_crypto::verify_x509_signature(&chain[i], &chain[i + 1]) {
             warn!("YasvaraKeybox: chain signature invalid at index {}", i);
-            return false;
+            return None;
         }
     }
     if let (Some(last_cert), Some(last_der)) = (certs.last(), chain.last()) {
@@ -388,10 +403,156 @@ fn validate_chain(chain: &[Vec<u8>]) -> bool {
             && !keystore2_crypto::verify_x509_signature(last_der, last_der)
         {
             warn!("YasvaraKeybox: self-signed root signature invalid");
-            return false;
+            return None;
         }
     }
-    true
+    Some(certs)
+}
+
+fn extract_rkp_manufacturer(certs: &[Certificate]) -> Option<String> {
+    for cert in certs {
+        let Some(exts) = cert.tbs_certificate.extensions.as_ref() else {
+            continue;
+        };
+        let Some(ext) = exts.iter().find(|e| e.extn_id == PROVISIONING_INFO_OID) else {
+            continue;
+        };
+        let bytes = ext.extn_value.as_bytes();
+        if bytes.len() > MAX_PROVISIONING_BYTES {
+            continue;
+        }
+        if let Some(mfg) = parse_provisioning_manufacturer(bytes) {
+            return Some(mfg);
+        }
+    }
+    None
+}
+
+fn parse_provisioning_manufacturer(cbor: &[u8]) -> Option<String> {
+    if cbor.is_empty() || cbor.len() > MAX_PROVISIONING_BYTES {
+        return None;
+    }
+    let mut pos = 0usize;
+    let map_len = read_cbor_header(cbor, &mut pos, 5)?;
+    for _ in 0..map_len {
+        let key_initial = *cbor.get(pos)?;
+        if (key_initial >> 5) == 0 {
+            let key = read_cbor_header(cbor, &mut pos, 0)?;
+            if key == 3 {
+                let val_len = read_cbor_header(cbor, &mut pos, 3)? as usize;
+                let end = pos.checked_add(val_len)?;
+                let raw = std::str::from_utf8(cbor.get(pos..end)?).ok()?;
+                let trimmed = raw.trim();
+                if trimmed.is_empty() || trimmed.len() > MAX_PROP_VALUE_BYTES {
+                    return None;
+                }
+                return Some(trimmed.to_string());
+            }
+        } else if !skip_cbor_item(cbor, &mut pos, 0) {
+            return None;
+        }
+        if !skip_cbor_item(cbor, &mut pos, 0) {
+            return None;
+        }
+    }
+    None
+}
+
+fn read_cbor_header(cbor: &[u8], pos: &mut usize, expected_major: u8) -> Option<u64> {
+    let initial = *cbor.get(*pos)?;
+    *pos += 1;
+    if (initial >> 5) != expected_major {
+        return None;
+    }
+    read_cbor_arg(cbor, pos, initial & 0x1f)
+}
+
+fn read_cbor_arg(cbor: &[u8], pos: &mut usize, ai: u8) -> Option<u64> {
+    if ai < 24 {
+        return Some(u64::from(ai));
+    }
+    let extra = match ai {
+        24 => 1usize,
+        25 => 2usize,
+        26 => 4usize,
+        27 => 8usize,
+        _ => return None,
+    };
+    let end = pos.checked_add(extra)?;
+    let slice = cbor.get(*pos..end)?;
+    *pos = end;
+    let mut val = 0u64;
+    for &b in slice {
+        val = (val << 8) | u64::from(b);
+    }
+    Some(val)
+}
+
+fn skip_cbor_item(cbor: &[u8], pos: &mut usize, depth: usize) -> bool {
+    if depth > MAX_CBOR_DEPTH {
+        return false;
+    }
+    let Some(&initial) = cbor.get(*pos) else {
+        return false;
+    };
+    *pos += 1;
+    let major = initial >> 5;
+    let ai = initial & 0x1f;
+    if major == 7 {
+        let extra = match ai {
+            0..=23 => 0usize,
+            24 => 1usize,
+            25 => 2usize,
+            26 => 4usize,
+            27 => 8usize,
+            _ => return false,
+        };
+        let Some(end) = pos.checked_add(extra) else {
+            return false;
+        };
+        if end > cbor.len() {
+            return false;
+        }
+        *pos = end;
+        return true;
+    }
+    let Some(arg) = read_cbor_arg(cbor, pos, ai) else {
+        return false;
+    };
+    match major {
+        0 | 1 => true,
+        2 | 3 => {
+            let Ok(len) = usize::try_from(arg) else {
+                return false;
+            };
+            let Some(end) = pos.checked_add(len) else {
+                return false;
+            };
+            if end > cbor.len() {
+                return false;
+            }
+            *pos = end;
+            true
+        }
+        4 => {
+            for _ in 0..arg {
+                if !skip_cbor_item(cbor, pos, depth + 1) {
+                    return false;
+                }
+            }
+            true
+        }
+        5 => {
+            for _ in 0..arg {
+                if !skip_cbor_item(cbor, pos, depth + 1) || !skip_cbor_item(cbor, pos, depth + 1) {
+                    return false;
+                }
+            }
+            true
+        }
+        6 => skip_cbor_item(cbor, pos, depth + 1),
+        _ => false,
+    }
 }
 
 fn extract_pem_bytes(pem: &str) -> Option<Vec<u8>> {
