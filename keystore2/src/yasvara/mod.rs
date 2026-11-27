@@ -19,6 +19,7 @@ use rustutils::android::system_properties;
 
 use yasvara_integrity_attest::keybox::{self, KeyboxEntry, SigningKey};
 use yasvara_integrity_attest::patcher;
+use yasvara_integrity_attest::policy as attest_policy;
 use yasvara_integrity_core::contract::{
     ATTEST_DIR, BASE_ATTEST_TARGETS, PATCH_OVERRIDE_FILENAME, PROP_BOOT_DIGEST,
     PROP_BOOT_VBMETA_PUBKEY_DIGEST, PROP_PATCH_OVERRIDE, PROP_PIF_ENABLED, PROP_PIF_PREFIX,
@@ -30,6 +31,7 @@ use yasvara_integrity_core::der::{
 };
 use yasvara_integrity_core::digest::parse_boot_digest;
 use yasvara_integrity_core::patch_override::resolve_patch_override_for_packages;
+use yasvara_integrity_core::policy::PolicySnapshot;
 use yasvara_integrity_core::version::{
     parse_long_patch, parse_os_patchlevel, parse_version_number, resolve_os_version_with_staged,
 };
@@ -51,6 +53,7 @@ pub enum ExplicitSigner<'a> {
 
 /// A single policy snapshot shared by request preparation and response handling.
 pub struct RequestPolicy {
+    snapshot: Option<PolicySnapshot>,
     patch: Option<AttestationContext>,
 }
 
@@ -76,7 +79,8 @@ impl RequestPolicy {
         caller_uid: u32,
         explicit_signer: ExplicitSigner<'_>,
     ) -> Self {
-        let mut policy = Self { patch: None };
+        let snapshot = attest_policy::current();
+        let mut policy = Self { snapshot, patch: None };
         let (managed_issuer, has_unmanaged) = match explicit_signer {
             ExplicitSigner::None => (None, false),
             ExplicitSigner::Unmanaged => (None, true),
@@ -94,12 +98,19 @@ impl RequestPolicy {
             }
         };
 
-        let master = system_properties::read(PROP_TRICKY_ENABLED).ok().flatten();
+        let master_prop;
+        let master = match policy.snapshot.as_ref() {
+            Some(snap) => Some(if snap.is_tricky_enabled() { "1" } else { "0" }),
+            None => {
+                master_prop = system_properties::read(PROP_TRICKY_ENABLED).ok().flatten();
+                master_prop.as_deref()
+            }
+        };
         let has_challenge = has_attestation_challenge(params);
         let is_attest_key = has_purpose_attest_key(params);
-        if !should_modify_attestation(caller_uid, master.as_deref(), has_unmanaged)
+        if !should_modify_attestation(caller_uid, master, has_unmanaged)
             || (!has_challenge && !is_attest_key)
-            || !is_target_request(params, caller_uid, has_challenge)
+            || !is_target_request(params, caller_uid, has_challenge, policy.snapshot.as_ref())
         {
             return policy;
         }
@@ -160,7 +171,10 @@ pub fn validated_imported_attest_key(
     SigningKey::from_pkcs8_der(key_data).map(|k| k.to_pkcs8_der())
 }
 
-fn is_builtin_pif_enabled() -> bool {
+fn is_builtin_pif_enabled(snapshot: Option<&PolicySnapshot>) -> bool {
+    if let Some(snap) = snapshot {
+        return snap.is_pif_enabled();
+    }
     match system_properties::read(PROP_PIF_ENABLED).ok().flatten() {
         Some(v) if v.trim() == "0" || v.trim().eq_ignore_ascii_case("false") => false,
         Some(v) if v.trim() == "1" || v.trim().eq_ignore_ascii_case("true") => true,
@@ -183,8 +197,15 @@ pub fn prepare_keymint_params(
     }
     let Some(context) = policy.patch.as_ref() else {
         if params.iter().any(|kp| kp.tag == Tag::ATTESTATION_ID_MANUFACTURER) {
-            if let Ok(Some(staged_mfg)) = system_properties::read(PROP_RKP_MANUFACTURER) {
-                let spoofed = staged_mfg.trim();
+            let staged_mfg = policy
+                .snapshot
+                .as_ref()
+                .map(|s| s.rkp_manufacturer.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .or_else(|| system_properties::read(PROP_RKP_MANUFACTURER).ok().flatten());
+            if let Some(staged) = staged_mfg {
+                let spoofed = staged.trim();
                 if !spoofed.is_empty() {
                     if let Some(hw_mfg) =
                         hw_prop(&["ro.product.vendor.manufacturer", "ro.product.manufacturer"])
@@ -196,7 +217,7 @@ pub fn prepare_keymint_params(
         }
         return params.to_vec();
     };
-    if is_builtin_pif_enabled() && is_pif_collector_caller(params) {
+    if is_builtin_pif_enabled(policy.snapshot.as_ref()) && is_pif_collector_caller(params) {
         return params
             .iter()
             .filter(|kp| {
@@ -332,7 +353,7 @@ pub fn maybe_patch_generated_key(
         return PatchedCreation { result: creation_result, sw_attest_key: None };
     }
 
-    let inputs = PatchInputs::from_request(params, context);
+    let inputs = PatchInputs::from_request(params, context, policy.snapshot.as_ref());
     let patch_config = inputs.as_config(&context.canonical_boot_digest);
     let replacement_spki = sw_signer.as_ref().map(|k| k.to_spki_der());
 
@@ -388,37 +409,61 @@ struct PatchInputs {
 }
 
 impl PatchInputs {
-    fn from_request(params: &[KeyParameter], context: &AttestationContext) -> Self {
+    fn from_request(
+        params: &[KeyParameter],
+        context: &AttestationContext,
+        snapshot: Option<&PolicySnapshot>,
+    ) -> Self {
         let is_collector = is_pif_collector_caller(params);
-        let use_pif = is_builtin_pif_enabled() && is_collector;
+        let use_pif = is_builtin_pif_enabled(snapshot) && is_collector;
         let id_overrides = if use_pif {
-            resolve_pif_id_overrides()
+            snapshot
+                .and_then(PolicySnapshot::pif_id_overrides)
+                .or_else(resolve_pif_id_overrides)
         } else if !is_collector {
             resolve_rkp_id_overrides(&context.keybox)
         } else {
             None
         };
-        let app_patch_override = resolve_patch_override_for_request(params);
+        let app_patch_override = resolve_patch_override_for_request(params, snapshot);
         let host_release = system_properties::read("ro.build.version.release").ok().flatten();
         let host_patch = system_properties::read("ro.build.version.security_patch").ok().flatten();
 
         let (os_version, os_patchlevel, long_patch) = if use_pif {
-            let staged_os = pif_prop("os_version");
-            let pif_release = pif_prop("release");
-            let pif_build_id = pif_prop("build_id");
-            let pif_active = staged_os.is_some()
-                || pif_release.is_some()
-                || pif_build_id.is_some()
-                || pif_prop("brand").is_some()
-                || pif_prop("model").is_some();
-            let os_ver = resolve_os_version_with_staged(
-                staged_os.as_deref(),
-                pif_release.as_deref(),
-                pif_build_id.as_deref(),
-                pif_active,
-                host_release.as_deref(),
-            );
-            let active_patch = app_patch_override.or_else(|| pif_prop("security_patch"));
+            let (os_ver, pif_patch) = if let Some(snap) = snapshot {
+                let staged_os = (snap.os_version > 0).then(|| snap.os_version.to_string());
+                let pif_release = (!snap.pif_release.is_empty()).then_some(snap.pif_release.as_str());
+                let pif_build_id =
+                    (!snap.pif_build_id.is_empty()).then_some(snap.pif_build_id.as_str());
+                let os_ver = resolve_os_version_with_staged(
+                    staged_os.as_deref(),
+                    pif_release,
+                    pif_build_id,
+                    snap.has_pif_profile(),
+                    host_release.as_deref(),
+                );
+                let patch = (!snap.pif_security_patch.is_empty())
+                    .then(|| snap.pif_security_patch.clone());
+                (os_ver, patch)
+            } else {
+                let staged_os = pif_prop("os_version");
+                let pif_release = pif_prop("release");
+                let pif_build_id = pif_prop("build_id");
+                let pif_active = staged_os.is_some()
+                    || pif_release.is_some()
+                    || pif_build_id.is_some()
+                    || pif_prop("brand").is_some()
+                    || pif_prop("model").is_some();
+                let os_ver = resolve_os_version_with_staged(
+                    staged_os.as_deref(),
+                    pif_release.as_deref(),
+                    pif_build_id.as_deref(),
+                    pif_active,
+                    host_release.as_deref(),
+                );
+                (os_ver, pif_prop("security_patch"))
+            };
+            let active_patch = app_patch_override.or(pif_patch);
             let os_pl = active_patch
                 .as_deref()
                 .or(host_patch.as_deref())
@@ -469,15 +514,20 @@ fn is_pif_collector_caller(params: &[KeyParameter]) -> bool {
 /// Security fix: `security_level.rs` only sets authoritative `ATTESTATION_APPLICATION_ID` when
 /// `has_challenge` is true. For non-challenged `PURPOSE_ATTEST_KEY`, ALWAYS resolve the caller's
 /// authoritative AAID via `keystore2_aaid::get_aaid(caller_uid)` rather than trusting caller params.
-fn is_target_request(params: &[KeyParameter], caller_uid: u32, has_challenge: bool) -> bool {
+fn is_target_request(
+    params: &[KeyParameter],
+    caller_uid: u32,
+    has_challenge: bool,
+    snapshot: Option<&PolicySnapshot>,
+) -> bool {
     if has_challenge {
         if let Some(aaid) = aaid_blob(params) {
-            return is_target_aaid(aaid);
+            return is_target_aaid(aaid, snapshot);
         }
         return false;
     }
     match keystore2_aaid::get_aaid(caller_uid) {
-        Ok(aaid) => is_target_aaid(&aaid),
+        Ok(aaid) => is_target_aaid(&aaid, snapshot),
         Err(e) => {
             warn!("Yasvara: get_aaid({}) failed during ATTEST_KEY check: {}", caller_uid, e);
             false
@@ -485,7 +535,10 @@ fn is_target_request(params: &[KeyParameter], caller_uid: u32, has_challenge: bo
     }
 }
 
-fn is_target_aaid(aaid: &[u8]) -> bool {
+fn is_target_aaid(aaid: &[u8], snapshot: Option<&PolicySnapshot>) -> bool {
+    if let Some(snap) = snapshot {
+        return snap.is_target_aaid(aaid);
+    }
     if BASE_ATTEST_TARGETS.iter().any(|pkg| aaid_has_package(aaid, pkg.as_bytes())) {
         return true;
     }
@@ -499,10 +552,27 @@ fn is_target_aaid(aaid: &[u8]) -> bool {
     }
 }
 
-/// Resolves per-app (or wildcard `"*"`) security patch override from the JSON file published by
-/// `YasvaraAttestationService` (`/data/misc/yasvara_attest/patch_override`), falling back to
-/// `persist.sys.yasvara.trickystore.patch_override` for global overrides.
-fn resolve_patch_override_for_request(params: &[KeyParameter]) -> Option<String> {
+/// Resolves per-app (or wildcard `"*"`) security patch override from the cached binary
+/// `policy.bin` snapshot (zero disk I/O / JSON parsing on steady state), falling back to legacy
+/// `patch_override` / `persist.sys.yasvara.trickystore.patch_override` only before `policy.bin`
+/// is published.
+fn resolve_patch_override_for_request(
+    params: &[KeyParameter],
+    snapshot: Option<&PolicySnapshot>,
+) -> Option<String> {
+    if let Some(snap) = snapshot {
+        let mut pkgs: Vec<String> = Vec::new();
+        if let Some(aaid) = aaid_blob(params) {
+            for_each_aaid_package(aaid, |pkg| {
+                if let Ok(s) = core::str::from_utf8(pkg) {
+                    pkgs.push(s.to_owned());
+                }
+                false
+            });
+        }
+        let refs: Vec<&str> = pkgs.iter().map(String::as_str).collect();
+        return snap.resolve_patch_override(&refs).map(str::to_owned);
+    }
     if let Some(aaid) = aaid_blob(params) {
         if let Ok(raw_json) =
             std::fs::read_to_string(format!("{ATTEST_DIR}/{PATCH_OVERRIDE_FILENAME}"))

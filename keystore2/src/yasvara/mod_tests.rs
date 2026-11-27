@@ -49,6 +49,7 @@ fn collector_params() -> Vec<KeyParameter> {
 
 fn ready_policy() -> RequestPolicy {
     RequestPolicy {
+        snapshot: None,
         patch: Some(AttestationContext {
             canonical_boot_digest: vec![1; 32],
             keybox: KeyboxEntry { ec: None, rsa: None, rkp_manufacturer: None },
@@ -80,7 +81,7 @@ fn disabled_unavailable_and_explicit_signer_policies_preserve_request_and_respon
         (101_000, Some("1"), false),
     ] {
         assert!(!should_modify_attestation(uid, master, explicit_key));
-        let policy = RequestPolicy { patch: None };
+        let policy = RequestPolicy { snapshot: None, patch: None };
         assert_eq!(prepare_keymint_params(&params, &policy), params);
         let original = KeyCreationResult {
             keyBlob: vec![1, 2, 3],
