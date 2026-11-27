@@ -71,6 +71,8 @@ rust_defaults {
         "libthiserror",
         "libtokio",
         "libwatchdog_rs",
+        "libyasvara_integrity_attest",
+        "libyasvara_integrity_core",
         "packagemanager_aidl-rust",
     ],
     shared_libs: [
